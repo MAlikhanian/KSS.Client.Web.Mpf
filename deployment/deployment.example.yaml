@@ -1,0 +1,392 @@
+# =============================================================================
+#  KSS Client Web — MPF domain app (multi-zone)
+# =============================================================================
+#  Modelled on Shell/deployment/deployment.yaml. Three deliberate differences,
+#  each explained where it occurs:
+#
+#   1. NO INGRESS. This zone has no public entrypoint. The Shell is the only
+#      thing the internet talks to; it rewrites /mpf/* to this Service over
+#      cluster DNS. Giving the zone its own Ingress would expose it directly —
+#      and this app has no middleware.ts, so an unauthenticated visitor would
+#      get a rendering page instead of a redirect to sign-in.
+#
+#   2. PROBES HIT /mpf/api/manifest, NOT /api/health. This app has no health
+#      route (Shell has one, Mpf does not). Copying Shell's probe verbatim
+#      would fail every check and CrashLoopBackOff the pod. See the probe block.
+#
+#   3. Smaller footprint. This zone serves one page; Shell serves the estate.
+#
+#  ---------------------------------------------------------------------------
+#  THREE THINGS ARE NOT IN THIS FILE. Applying it alone gets you nothing
+#  working. Full runbook in docker-k8s-command.txt; in order of how quietly
+#  each one fails:
+#
+#   A. docker-secret, in THIS namespace          (command file, step 5)
+#      Secrets are namespace-scoped, so the one in kss-client-web does not
+#      carry over. Pods sit in ImagePullBackOff — loud, and `kubectl describe`
+#      names the cause.
+#
+#   B. nextauth-secret, copied from the Shell    (command file, step 6)
+#      Deliberately absent from the Secret below. Pod refuses to start with
+#      CreateContainerConfigError until it exists — loud by design. See the
+#      NEXTAUTH_SECRET note in the Deployment.
+#
+#   C. ZONES, on the SHELL                       (command file, step 8)
+#      ZONES={"mpf":"http://kss-client-web-mpf-service.kss-client-web-mpf.svc.cluster.local"}
+#      This is the silent one. Unset, the Shell keeps serving /mpf from its own
+#      bundled copy: these pods run, pass every probe, report Ready, and take
+#      zero traffic. Nothing anywhere reports a problem. Step 9 of the command
+#      file is the only way to tell the difference.
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kss-client-web-mpf
+  labels:
+    name: kss-client-web-mpf
+    app: kss-client-web-mpf
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kss-client-web-mpf
+  namespace: kss-client-web-mpf
+  labels:
+    app: kss-client-web-mpf
+    version: v1.0.0
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: kss-client-web-mpf
+  template:
+    metadata:
+      labels:
+        app: kss-client-web-mpf
+        version: v1.0.0
+    spec:
+      imagePullSecrets:
+      - name: docker-secret
+      containers:
+      - name: kss-client-web-mpf
+        image: docker-hosted.sebaoffice.ir/kss-client-web-mpf:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: HOSTNAME
+          value: "0.0.0.0"
+        - name: TZ
+          value: "UTC"
+
+        # Same reason as the Shell: the NextAuth session cookie carries every
+        # permission claim (~25 KB JWE-encoded) and overflows Node's default
+        # 16 KB header buffer. This zone receives that same cookie, so it needs
+        # the same allowance or the request arrives as HTTP 431 / 502.
+        - name: NODE_OPTIONS
+          value: "--max-http-header-size=131072"
+
+        # ── Auth ────────────────────────────────────────────────────────────
+        # ⚠ NEXTAUTH_SECRET MUST BE BYTE-IDENTICAL TO THE SHELL'S.
+        # This app does not issue sessions — it decrypts the cookie the Shell
+        # issued. A different value is not weaker auth, it is broken auth.
+        #
+        # The `nextauth-secret` key is deliberately ABSENT from the Secret
+        # below, and this reference is deliberately NOT `optional`. Together
+        # that gives CreateContainerConfigError — the pod refuses to start.
+        # That is the loud failure we want, and it is why the key is missing
+        # rather than empty:
+        #
+        #   an EMPTY value is valid base64, so the key would exist, the pod
+        #   would START, and next-auth would read "" (it uses ??, so "" is not
+        #   defaulted). assert.js then returns MissingSecret in production,
+        #   getServerSession throws on the non-200, and every BFF route returns
+        #   500 — while the probes below hit /mpf/api/manifest, which needs no
+        #   session, so the pod reports Ready the whole time. A healthy-looking
+        #   deployment where every data call fails is the worst outcome here.
+        #
+        # A second reason not to check the key in: `kubectl apply -f` would
+        # re-blank a hand-patched value on every subsequent apply.
+        #
+        # Populate it out-of-band from the Shell's own secret — see
+        # docker-k8s-command.txt step 6.
+        #
+        - name: NEXTAUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: nextauth-secret
+
+        # The public origin. Cookies are scoped by host and path, never by
+        # port or by which pod answered — so this stays the Shell's URL.
+        - name: NEXTAUTH_URL
+          value: "https://erp.seba.ir"
+
+        # Used by next.config.mjs to proxy /api/auth/* back to the Shell. That
+        # rewrite is DEV-ONLY (it returns [] when NODE_ENV !== development), so
+        # in cluster this is inert — set for parity and for local `docker run`.
+        - name: SHELL_URL
+          value: "https://erp.seba.ir"
+
+        # ── Application ─────────────────────────────────────────────────────
+        # NEXT_PUBLIC_BASE_PATH is inlined at BUILD time by the Dockerfile ARG,
+        # not read here. It is set at runtime too so a mismatch is visible in
+        # `kubectl describe` rather than only in a stale bundle.
+        - name: NEXT_PUBLIC_BASE_PATH
+          value: "/mpf"
+        - name: NEXT_PUBLIC_APP_NAME
+          value: "KSS_Client_Web_mpf"
+
+        # ── Tenant branding ─────────────────────────────────────────────────
+        # Same ConfigMap pattern as the Shell's. Resolved per request in
+        # app/layout.tsx against x-kss-host, which the Shell's middleware stamps
+        # from the real Host header. Value is generated from the SHELL manifest
+        # by _Kit tooling -- all 13 carry a byte-identical object, so a tenant
+        # cannot be branded on Shell pages and unbranded inside a zone.
+        # configMapKeyRef is frozen at container start: changing the ConfigMap
+        # needs a rollout restart, not just an apply.
+        - name: TENANTS
+          valueFrom:
+            configMapKeyRef:
+              name: kss-client-web-mpf-config
+              key: tenants
+
+        # ── Backend services this app actually calls ────────────────────────
+        # Only these two are read by Mpf's code (app/, services/, providers/).
+        # The Shell's other API base URLs are deliberately not carried over.
+        - name: MPF_REPORT_API_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: kss-client-web-mpf-config
+              key: mpf-report-api-base-url
+        - name: AUTH_API_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: kss-client-web-mpf-config
+              key: auth-api-base-url
+
+        # ── Object storage ──────────────────────────────────────────────────
+        # Referenced by shared lib code copied in from _Kit. Marked optional so
+        # an absent secret does not block startup — this app has no upload path.
+        - name: STORAGE_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-endpoint
+              optional: true
+        - name: STORAGE_REGION
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-region
+              optional: true
+        - name: STORAGE_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-bucket
+              optional: true
+        - name: STORAGE_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-access-key-id
+              optional: true
+        - name: STORAGE_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-secret-access-key
+              optional: true
+        - name: STORAGE_CDN_URL
+          valueFrom:
+            secretKeyRef:
+              name: kss-client-web-mpf-secrets
+              key: storage-cdn-url
+              optional: true
+
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        # ── Probes ──────────────────────────────────────────────────────────
+        # ⚠ NOT /api/health — this app does not have that route. Verified
+        # against the running app: /mpf/api/health and /api/health both 404.
+        #
+        # /mpf/api/manifest is used instead because it is a route this app
+        # genuinely owns, it needs no session, and it touches no database — so
+        # it fails when the app is broken and not when a backend is down. It is
+        # also the exact endpoint that proves a request reached THIS zone
+        # rather than the Shell, which has no such route.
+        #
+        # If a real /api/health is added later (mirroring the Shell's), switch
+        # both probes to /mpf/api/health and delete this note.
+        livenessProbe:
+          httpGet:
+            path: /mpf/api/health
+            port: 3000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /mpf/api/health
+            port: 3000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # timeoutSeconds is explicit: the default is 1s, and this is the same
+        # endpoint the other two probes are given 5s and 10s for. A cold Next.js
+        # start answering in 1.2s would fail startup while readiness would have
+        # passed it — the probe most likely to be slow had the least patience.
+        # (initialDelaySeconds on liveness/readiness above is inert while a
+        # startupProbe exists; the kubelet runs neither until this one passes.)
+        startupProbe:
+          httpGet:
+            path: /mpf/api/health
+            port: 3000
+            scheme: HTTP
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 24
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kss-client-web-mpf-service
+  namespace: kss-client-web-mpf
+  labels:
+    app: kss-client-web-mpf
+spec:
+  selector:
+    app: kss-client-web-mpf
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP
+  type: ClusterIP
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kss-client-web-mpf-config
+  namespace: kss-client-web-mpf
+data:
+  # In-cluster address of the MabnaERP report API. Same value the Shell uses.
+  mpf-report-api-base-url: "http://kss-mpf-erp-mabna-report-service-service.kss-mpf-erp-mabna-report-service.svc.cluster.local"
+  auth-api-base-url: "https://auth.api.sebaoffice.ir"
+  tenants: '{"erp.seba.ir":{"name":"SEBA","logo":"/media/app/default-logo.svg","logoDark":"/media/app/default-logo-dark.svg","logoMini":"/media/app/mini-logo.svg","favicon":"/favicon.ico","banner":"/media/images/2600x1600/1.png","bannerDark":"/media/images/2600x1600/1-dark.png","companyId":"019f317a-12ba-764f-b19b-e064e36b4be8","footer":{"brand":{"label":"SEBA","href":"https://seba.ir"},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":"https://www.seba.ir/%D8%AA%D9%85%D8%A7%D8%B3-%D8%A8%D8%A7-%DA%A9%D8%A7%D9%86%D9%88%D9%86"},{"en":"Support","fa":"پشتیبانی","href":"https://www.seba.ir/%D8%AA%D9%85%D8%A7%D8%B3-%D8%A8%D8%A7-%DA%A9%D8%A7%D9%86%D9%88%D9%86"},{"en":"License","fa":"مجوز","href":""}]}},"members.sebaoffice.ir":{"name":"SEBA","logo":"/media/app/default-logo.svg","logoDark":"/media/app/default-logo-dark.svg","logoMini":"/media/app/mini-logo.svg","favicon":"/favicon.ico","banner":"/media/images/2600x1600/1.png","bannerDark":"/media/images/2600x1600/1-dark.png","companyId":"019f317a-12ba-764f-b19b-e064e36b4be8","footer":{"brand":{"label":"SEBA","href":"https://seba.ir"},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":"https://www.seba.ir/%D8%AA%D9%85%D8%A7%D8%B3-%D8%A8%D8%A7-%DA%A9%D8%A7%D9%86%D9%88%D9%86"},{"en":"Support","fa":"پشتیبانی","href":"https://www.seba.ir/%D8%AA%D9%85%D8%A7%D8%B3-%D8%A8%D8%A7-%DA%A9%D8%A7%D9%86%D9%88%D9%86"},{"en":"License","fa":"مجوز","href":""}]}},"nerp.sajoffice.ir":{"name":"SAJ","logo":"/media/tenants/saj/logo.png","logoDark":"/media/tenants/saj/logo.png","logoMini":"/media/tenants/saj/logo.png","favicon":"/media/tenants/saj/favicon.png","banner":"/media/tenants/saj/banner.jpg","bannerDark":"/media/tenants/saj/banner.jpg","companyId":"019f0e6c-9fbc-78cf-9202-fa932a9878f7","footer":{"brand":{"label":"SAJ","href":""},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":""},{"en":"Support","fa":"پشتیبانی","href":""},{"en":"License","fa":"مجوز","href":""}]}},"erp.mpfoffice.ir":{"name":"MPF","logo":"/media/tenants/mpf/logo.svg","logoDark":"/media/tenants/mpf/logo-dark.svg","logoMini":"/media/tenants/mpf/logo-mini.svg","favicon":"/media/tenants/mpf/favicon.svg","banner":"/media/tenants/mpf/banner.svg","bannerDark":"/media/tenants/mpf/banner-dark.svg","companyId":"019f7a3e-1d43-7bcb-a7f3-eb97572e2e02","footer":{"brand":{"label":"MPF","href":""},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":""},{"en":"Support","fa":"پشتیبانی","href":""},{"en":"License","fa":"مجوز","href":""}]}},"spmoffice.ir":{"name":"SPM","logo":"/media/tenants/spm/logo.svg","logoDark":"/media/tenants/spm/logo-dark.svg","logoMini":"/media/tenants/spm/logo-mini.svg","favicon":"/media/tenants/spm/favicon.svg","banner":"/media/tenants/spm/banner.svg","bannerDark":"/media/tenants/spm/banner-dark.svg","companyId":"01a04744-68ae-7aef-b9d0-b5fb31d7a80c","footer":{"brand":{"label":"SPM","href":""},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":""},{"en":"Support","fa":"پشتیبانی","href":""},{"en":"License","fa":"مجوز","href":""}]}},"mkoffice.ir":{"name":"MK","footer":{"brand":{"label":"مشیران کاریز","href":"https://moshirankariz.com"},"links":[{"en":"Docs","fa":"مستندات","href":""},{"en":"Purchase","fa":"خرید","href":""},{"en":"FAQ","fa":"سوالات متداول","href":""},{"en":"Support","fa":"پشتیبانی","href":""},{"en":"License","fa":"مجوز","href":""}]},"logo":"/media/tenants/mk/logo.png","logoDark":"/media/tenants/mk/logo.png","logoMini":"/media/tenants/mk/logo.png","favicon":"/media/tenants/mk/favicon.ico","banner":"/media/tenants/mk/banner.jpg","bannerDark":"/media/tenants/mk/banner.jpg","companyId":"01a07fb0-e2e7-7822-b14b-3a70278009ef"}}'
+---
+# ⚠ `nextauth-secret` IS NOT IN THIS FILE, AND MUST NOT BE ADDED TO IT.
+#
+# Two reasons, both load-bearing:
+#   1. An empty value here would let the pod START and then 500 every data
+#      route while probes keep reporting Ready. Absent + non-optional gives
+#      CreateContainerConfigError instead — the pod never starts. See the
+#      NEXTAUTH_SECRET note in the Deployment above.
+#   2. `kubectl apply -f deployment.yaml` would re-blank a hand-patched value
+#      on every subsequent apply, silently, long after anyone remembers why.
+#
+# Create it out-of-band — docker-k8s-command.txt step 6 copies it from the
+# Shell's secret directly, which is the only correct source.
+#
+# The storage keys below ARE checked in as empty because their references are
+# marked `optional: true`: absent or empty, the pod starts either way, and this
+# app has no upload path today. They are read by lib/s3-client.ts and
+# lib/s3-upload.ts, which no current route reaches.
+#
+# To set a single value:
+#   kubectl patch secret kss-client-web-mpf-secrets -n kss-client-web-mpf \
+#     -p "{\"data\":{\"KEY\":\"$(echo -n 'VALUE' | base64 -w0)\"}}"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kss-client-web-mpf-secrets
+  namespace: kss-client-web-mpf
+type: Opaque
+data:
+  storage-endpoint: "<STORAGE_ENDPOINT_BASE64>"
+  storage-region: "<STORAGE_REGION_BASE64>"
+  storage-bucket: "<STORAGE_BUCKET_BASE64>"
+  storage-access-key-id: "<STORAGE_ACCESS_KEY_ID_BASE64>"
+  storage-secret-access-key: "<STORAGE_SECRET_ACCESS_KEY_BASE64>"
+  storage-cdn-url: "<STORAGE_CDN_URL_BASE64>"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kss-client-web-mpf-pdb
+  namespace: kss-client-web-mpf
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: kss-client-web-mpf
+---
+# Only the Shell may reach this zone. There is no Ingress, so this is belt and
+# braces — but it is the control that makes "no public entrypoint" a property
+# of the cluster rather than of a file nobody re-reads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kss-client-web-mpf-network-policy
+  namespace: kss-client-web-mpf
+spec:
+  podSelector:
+    matchLabels:
+      app: kss-client-web-mpf
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: kss-client-web
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - { protocol: TCP, port: 80 }
+    - { protocol: TCP, port: 443 }
+    - { protocol: TCP, port: 8000 }

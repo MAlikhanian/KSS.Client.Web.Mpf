@@ -1,0 +1,77 @@
+npm run build
+npm run start
+
+# Step 1: Login to Docker registry
+docker login docker-hosted.sebaoffice.ir
+
+# Step 2: Build the Docker image (pass basePath so assets resolve under /mpf)
+docker build --build-arg NEXT_PUBLIC_BASE_PATH=/mpf --build-arg NEXT_PUBLIC_APP_NAME=KSS_Client_Web_mpf -t docker-hosted.sebaoffice.ir/kss-client-web-mpf:latest .
+
+# Alternative: Build and push in one command (if using buildx)
+docker buildx build --push --build-arg NEXT_PUBLIC_BASE_PATH=/mpf --build-arg NEXT_PUBLIC_APP_NAME=KSS_Client_Web_mpf -t docker-hosted.sebaoffice.ir/kss-client-web-mpf:latest .
+
+# NextAuth: this app does not issue sessions, it decrypts the cookie the Shell issued.
+# nextauth-secret must be byte-identical to the Shell's. deployment.yaml omits the key on
+# purpose — absent + non-optional gives CreateContainerConfigError, so the pod refuses to
+# start until Step 4 runs. An empty value would instead start the pod and 500 every data
+# route while the probes keep reporting Ready.
+#   kubectl patch secret kss-client-web-mpf-secrets -n kss-client-web-mpf -p "{\"data\":{\"nextauth-secret\":\"$(kubectl get secret kss-client-web-secrets -n kss-client-web -o jsonpath='{.data.nextauth-secret}')\"}}"
+#   kubectl rollout restart deployment/kss-client-web-mpf -n kss-client-web-mpf
+
+# Step 3: Push the image to registry
+docker push docker-hosted.sebaoffice.ir/kss-client-web-mpf:latest
+
+# Step 4: Create secrets (first time only — copy nextauth-secret from the Shell, do not invent one)
+#   kubectl create secret generic kss-client-web-mpf-secrets -n kss-client-web-mpf \
+#     --from-literal=nextauth-secret="$(kubectl get secret kss-client-web-secrets -n kss-client-web -o jsonpath='{.data.nextauth-secret}' | base64 -d)" \
+#     --from-literal=storage-endpoint='' --from-literal=storage-region='' \
+#     --from-literal=storage-bucket='' --from-literal=storage-access-key-id='' \
+#     --from-literal=storage-secret-access-key='' --from-literal=storage-cdn-url='' \
+#     --dry-run=client -o yaml | kubectl apply -f -
+
+# Step 5: Apply manifests (Namespace + Deployment + Service + ConfigMap + Secret + PDB + NetworkPolicy)
+kubectl apply -f deployment.yaml
+
+# Step 6: Restart deployment so pods pick up ConfigMap/Secret changes
+kubectl rollout restart deployment/kss-client-web-mpf -n kss-client-web-mpf
+kubectl rollout status deployment/kss-client-web-mpf -n kss-client-web-mpf
+
+# Step 7: Point the Shell at this zone (nothing reaches these pods without it)
+# The Shell's middleware reads ZONES and rewrites /mpf/* here. Unset, the Shell keeps
+# serving /mpf from its own bundled copy: these pods run, pass every probe, and take
+# zero traffic. Add to the Shell's env, then restart it.
+#   ZONES={"mpf":"http://kss-client-web-mpf-service.kss-client-web-mpf.svc.cluster.local"}
+#   kubectl rollout restart deployment/kss-client-web -n kss-client-web
+
+# Step 8: Verify the zone hop (only /mpf/api/manifest can prove it — the Shell has no such route)
+#   200 = the Shell is proxying here.  404 = ZONES is not in effect.
+#   /mpf/report returns 200 either way, so it proves nothing.
+curl -s -o /dev/null -w "%{http_code}\n" https://erp.seba.ir/mpf/api/manifest
+
+# Create docker-registry secret (first time only)
+kubectl create secret docker-registry docker-secret \
+  --docker-server=docker-hosted.sebaoffice.ir \
+  --docker-username=<REGISTRY_USERNAME> \
+  --docker-password=<REGISTRY_PASSWORD> \
+  --namespace kss-client-web-mpf
+
+# Useful diagnostic commands
+kubectl get pods -n kss-client-web-mpf
+kubectl get secrets -n kss-client-web-mpf
+kubectl get configmaps -n kss-client-web-mpf
+kubectl get svc -n kss-client-web-mpf
+kubectl get networkpolicy -n kss-client-web-mpf
+kubectl get pdb -n kss-client-web-mpf
+
+# Check pod logs
+kubectl logs -n kss-client-web-mpf -l app=kss-client-web-mpf --tail=50
+
+# Check pod env vars
+kubectl exec -it $(kubectl get pods -n kss-client-web-mpf -l app=kss-client-web-mpf -o jsonpath='{.items[0].metadata.name}') -n kss-client-web-mpf -- env | sort
+
+# Reach the zone from inside the cluster, bypassing the Shell
+kubectl run -n kss-client-web-mpf tmp-curl --rm -it --image=curlimages/curl --restart=Never -- curl -s -o /dev/null -w "%{http_code}\n" http://kss-client-web-mpf-service.kss-client-web-mpf.svc.cluster.local/mpf/api/manifest
+
+# Delete resources if needed
+kubectl delete networkpolicy kss-client-web-mpf-network-policy -n kss-client-web-mpf
+kubectl delete secrets docker-secret -n kss-client-web-mpf
